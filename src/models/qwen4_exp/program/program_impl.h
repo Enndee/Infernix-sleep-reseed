@@ -63,6 +63,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -2486,8 +2487,104 @@ private:
     }
 
     // ---------------------------------------------------------------- VRAM monitor (design §19.3.7)
+    static std::uint64_t sleep_env_count(const char* name) {
+        const char* text = std::getenv(name);
+        if (text == nullptr || *text == '\0') { return 0; }
+        char* end = nullptr;
+        const unsigned long long value = std::strtoull(text, &end, 10);
+        if (end == text) { return 0; }
+        return static_cast<std::uint64_t>(value);
+    }
+    // A round with work moved the idle deadline away.
+    void note_round_activity() noexcept { sleep_busy_at_.store(Clock::now().time_since_epoch().count()); }
+    // Whether the frames should be released now; safe from the monitor thread.
+    bool sleep_due() const noexcept {
+        if (sleep_after_seconds_ == 0 || sleep_asleep_.load()) { return false; }
+        const std::int64_t idle = Clock::now().time_since_epoch().count() - sleep_busy_at_.load();
+        const std::int64_t after =
+            std::chrono::duration_cast<Clock::duration>(std::chrono::seconds(sleep_after_seconds_)).count();
+        return idle >= after;
+    }
+    // At a boundary with the execution lock held and nothing in flight: releases every frame the
+    // keep floor does not need. The pools' arenas keep their addresses, so nothing is reloaded.
+    void sleep_expert_cache() {
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        if (sleep_asleep_.load() || !residency_) { return; }
+        if (!residency_->elastic()) {
+            diagnostic("expert-cache sleep unavailable: the pools have no VMM arena", DiagnosticLevel::Warning);
+            sleep_after_seconds_ = 0;
+            return;
+        }
+        const std::uint32_t before       = residency_->frames();
+        const std::uint64_t bytes_before = residency_->pool_bytes();
+        if (before <= sleep_keep_frames_) {
+            sleep_asleep_.store(true);
+            return;
+        }
+        device_.synchronize();
+        // Preserve the ranking so the awake cache can be reseeded with its hottest experts.
+        sleep_state_ = residency_->saved_state();
+        const auto start   = Clock::now();
+        const auto resized = residency_->resize(sleep_keep_frames_, device_.stream, *vram_);
+        if (resized.frames > sleep_keep_frames_) {
+            diagnostic("expert-cache sleep deferred: a lease holds the frames");
+            return;
+        }
+        sleep_frames_awake_ = before;
+        frames_now_         = resized.frames;
+        pool_now_           = residency_->pool_bytes();
+        sleep_asleep_.store(true);
+        const std::uint64_t released = bytes_before > pool_now_ ? bytes_before - pool_now_ : 0;
+        char part[96];
+        std::snprintf(part, sizeof(part), " | %.2f s | free VRAM %llu MiB",
+                      std::chrono::duration<double>(Clock::now() - start).count(),
+                      static_cast<unsigned long long>((monitor_ ? monitor_->refresh().device_free : 0) >> 20));
+        diagnostic("expert cache asleep | frames " + std::to_string(before) + " -> " + std::to_string(resized.frames) +
+                   " | released " + std::to_string(released >> 20) + " MiB" + part);
+    }
+    // Gives the frames back at the keep floor's expense: the chunks are remapped empty and the
+    // cache refills from the pinned host copies as the round routes its experts.
+    void wake_expert_cache(const char* reason) {
+        const std::lock_guard<std::mutex> lock(vram_mutex_);
+        if (!sleep_asleep_.load() || !residency_) { return; }
+        const auto start           = Clock::now();
+        const std::uint32_t target = std::min(sleep_frames_awake_, residency_->frame_limit());
+        device_.synchronize(); // the round's own work has not been enqueued yet; earlier work is done
+        const auto resized         = residency_->resize(target, device_.stream, *vram_);
+        frames_now_                = resized.frames;
+        pool_now_                  = residency_->pool_bytes();
+        // Reseed the hottest experts from the state captured at sleep, so the first request after a
+        // wake starts with a warm cache instead of paying every miss over PCIe.
+        std::uint32_t seeded = 0;
+        if (sleep_state_) {
+            const auto max_keys = static_cast<std::uint32_t>(kSeedShare * static_cast<double>(residency_->frames()));
+            seeded              = residency_->warm_start(*sleep_state_, kSeedCountCap, max_keys, device_.stream);
+            device_.synchronize();
+            sleep_state_.reset();
+        }
+        const bool awake           = resized.frames > sleep_keep_frames_;
+        sleep_asleep_.store(!awake);
+        note_round_activity();
+        char part[96];
+        std::snprintf(part, sizeof(part), " | %.3f s", std::chrono::duration<double>(Clock::now() - start).count());
+        diagnostic("expert cache awake | frames " + std::to_string(resized.frames) + " of " + std::to_string(target) +
+                   part + " (" + reason + ") | seeded " + std::to_string(seeded) + " experts" +
+                   (awake ? "" : " | the device had no memory for them"));
+    }
+    void wake_expert_cache_if_asleep() {
+        if (sleep_after_seconds_ == 0 || !sleep_asleep_.load()) { return; }
+        wake_expert_cache("a round started");
+    }
+
     void start_vram_monitor(const VramDemand& demand) {
         if (!options_.vram_monitor) { return; }
+        sleep_after_seconds_ = sleep_env_count("INFERNIX_SLEEP_AFTER_SECONDS");
+        sleep_keep_frames_   = static_cast<std::uint32_t>(sleep_env_count("INFERNIX_SLEEP_KEEP_FRAMES"));
+        sleep_busy_at_.store(Clock::now().time_since_epoch().count());
+        if (sleep_after_seconds_ != 0) {
+            diagnostic("expert-cache sleep armed | release after " + std::to_string(sleep_after_seconds_) +
+                       " idle s | keep " + std::to_string(sleep_keep_frames_) + " frames");
+        }
         const VramSnapshot now = vram_->query();
         if (residency_->elastic()) {
             control_.emplace(demand, ExpertResidency::kChunkBytes, now.local_usage, residency_->pool_bytes(),
@@ -2509,7 +2606,7 @@ private:
     // pool, warns once per pressure episode that nothing absorbs it.
     void on_vram_snapshot(const VramSnapshot& snapshot) {
         const std::lock_guard<std::mutex> lock(vram_mutex_);
-        if (kv_idle_due() && waker_) { waker_(); }
+        if ((kv_idle_due() || sleep_due()) && waker_) { waker_(); }
         if (control_) {
             const auto d = control_->decide(snapshot, pool_now_, frames_now_, vram_seconds(), true);
             if ((d.shrink || d.grow) && waker_) { waker_(); }
@@ -2817,6 +2914,18 @@ public:
             std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; })) {
             kv_busy(); // one attempt per idle period: blocks without host copies may still hold the top
             shrink_kv(true);
+        }
+        if (sleep_after_seconds_ != 0) {
+            if (sleep_asleep_.load()) {
+                // Asleep: a request wakes the frames; nothing may grow the cache back meanwhile.
+                if (!idle) { wake_expert_cache("a round resumed"); }
+                return;
+            }
+            if (!idle) { note_round_activity(); }
+            if (idle && sleep_due()) {
+                sleep_expert_cache();
+                return;
+            }
         }
         if (!control_) { return; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
@@ -3320,6 +3429,7 @@ private:
         const cudaStream_t s = device_.stream;
         CUDA_CHECK(cudaMemcpyAsync(io_device_.p, io_host_.data(), io_layout_.bytes, cudaMemcpyHostToDevice, s));
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this call
+        wake_expert_cache_if_asleep(); // an idle sleep ends here, before the round's frame table is built
         residency_->before_round(s);
         // The ring's copies queue on the copy engine behind the io upload above. A call the CPU can
         // share (design §19.3.12) gates the stream on each layer's routing.
@@ -3581,6 +3691,7 @@ private:
         if (one_column_divisor() != 0) { *reinterpret_cast<std::int32_t*>(host_io() + io_layout_.divisor) = plain_divisor(position); }
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
+        wake_expert_cache_if_asleep(); // an idle sleep ends here, before the round's frame table is built
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
         replay(graphs_[static_cast<std::size_t>(batch - 1)],
@@ -3812,6 +3923,7 @@ private:
         upload_pinned(io_device_.p, io_host_.data(), io_layout_.ngram, s);
         upload_pinned(spec_device_.p, spec_host_.data(), 4ULL * spec_layout_.licensed, s);
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
+        wake_expert_cache_if_asleep(); // an idle sleep ends here, before the round's frame table is built
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         const execution::NgramRowGate gate = row_gate();
         replay(graph, [&] {
@@ -4514,6 +4626,21 @@ private:
     bool pressure_warned_     = false;
     Clock::time_point vram_epoch_{};
 
+    // ---- idle expert-cache sleep (experimental; opt-in through the environment) ----
+    // INFERNIX_SLEEP_AFTER_SECONDS=N releases the expert frames' VRAM after N idle seconds (0: off);
+    // INFERNIX_SLEEP_KEEP_FRAMES=K keeps K frames resident while asleep (default 0). The pools'
+    // virtual ranges never move, so a wake remaps empty chunks: the weights and the pinned host
+    // copies of every expert stay put and no request state is lost.
+    std::uint64_t sleep_after_seconds_ = 0; // written once, in start_vram_monitor
+    std::uint32_t sleep_keep_frames_   = 0;
+    std::atomic<std::int64_t> sleep_busy_at_{0}; // last round with work (the monitor thread reads it)
+    std::atomic<bool> sleep_asleep_{false};      // the frames are released
+    std::uint32_t sleep_frames_awake_ = 0;       // frames before the sleep (guarded by vram_mutex_)
+    // The cache's LFRU counts and resident ranking, captured before the frames are released so a
+    // wake can reseed the hottest experts instead of starting from an empty cache (guarded by
+    // vram_mutex_).
+    std::optional<expert_cache::SavedState> sleep_state_;
+
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0, pages_per_row_ = 0;
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
@@ -4819,7 +4946,11 @@ private:
         const std::size_t freed   = before - kv_vmm_->mapped_bytes();
         const std::uint64_t stride = residency_->frame_bytes();
         const std::uint32_t frames = residency_->frames();
-        (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
+        // While the cache sleeps the freed KV memory stays released: handing it to the frames would
+        // map them back and undo part of the sleep.
+        if (!sleep_asleep_.load()) {
+            (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
+        }
         if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
         frames_now_ = residency_->frames();
         pool_now_   = residency_->pool_bytes();
