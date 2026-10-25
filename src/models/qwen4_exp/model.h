@@ -72,6 +72,8 @@ public:
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const noexcept {
         return backing_.stats();
     }
+    // Residency-only mutation; weight values and their addresses are immutable.
+    [[nodiscard]] SleepableBuffer* sleepable_weights() const noexcept { return backing_.sleepable_device(); }
     // With vision offload: the pinned tower and its staging layout (no evictable pool: the encode
     // window borrows device memory from the expert cache, design §19.3.2).
     [[nodiscard]] const std::optional<qwen3_5::VisionOverlayAssets>& overlay_vision() const noexcept {

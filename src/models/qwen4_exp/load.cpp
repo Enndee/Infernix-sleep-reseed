@@ -10,6 +10,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <string_view>
 #include <algorithm>
 #include <map>
 #include <utility>
@@ -538,6 +540,12 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     if (!plan.impl_) { throw ArtifactError("load plan was already consumed"); }
     auto data    = std::move(plan.impl_);
     const artifact::Reader& reader = *data->materialization.source;
+    const char* sleep_weights = std::getenv("INFERNIX_SLEEP_WEIGHTS");
+    data->materialization.sleepable_device = sleep_weights && std::string_view(sleep_weights) == "1";
+    if (data->materialization.sleepable_device) {
+        // Reserve the immutable device mirror before the expert/host tiers consume their share.
+        data->materialization.later_pinned_bytes += data->materialization.device_capacity_bytes;
+    }
     auto backing = artifact::materialize(reader, std::move(data->materialization), device, observer);
     std::vector<BoundWeight> bound;
     bound.reserve(data->pending.size());

@@ -3,6 +3,7 @@
 #include "models/qwen4_exp/program/program.h"
 
 #include "core/arena.h"
+#include "core/sleepable_buffer.h"
 #include "core/cuda_vmm.h"
 #include "core/vmm_arena.h"
 #include "core/decode_graph.h"
@@ -864,7 +865,13 @@ public:
         if (max_width_ > 1) { allocate_verification(lanes, allocated); }
         work_capacity_ = plan_.work;
         wide_work_     = plan_.wide_work;
-        work_          = std::make_unique<WorkspaceArena>(work_capacity_);
+        if (options_.vram_monitor && sleep_env_count("INFERNIX_SLEEP_AFTER_SECONDS") != 0 &&
+            sleep_env_count("INFERNIX_SLEEP_SCRATCH") == 1) {
+            sleep_work_ = std::make_unique<SleepableBuffer>(work_capacity_, device_.device);
+            work_ = std::make_unique<WorkspaceArena>(sleep_work_->span());
+        } else {
+            work_ = std::make_unique<WorkspaceArena>(work_capacity_);
+        }
         allocated += work_capacity_;
 
         // The promotions' copy sources: the banks where the device reads them (cudaMemcpyBatchAsync
@@ -884,8 +891,13 @@ public:
         }
         // Staging slots for each layer call's misses (copied with a compact read window, design
         // 8.6), allocated before the frames take the remaining memory.
-        allocate(staging_, plan_.staging, allocated);
-        experts.staging_base  = static_cast<std::uint8_t*>(staging_.p);
+        if (sleep_work_ && plan_.staging != 0) {
+            sleep_staging_ = std::make_unique<SleepableBuffer>(plan_.staging, device_.device);
+            allocated += plan_.staging;
+        } else {
+            allocate(staging_, plan_.staging, allocated);
+        }
+        experts.staging_base  = static_cast<std::uint8_t*>(staging_data());
         experts.staging_slots = plan_.staging_slots;
         // The expert cache's tables and route log; its frames come last (below).
         residency_ = std::make_unique<ExpertResidency>(c_, std::move(banks), record_stride, columns_, device_.device,
@@ -1270,6 +1282,10 @@ public:
     // The prefix cache's choice for the request (without a lane: a lane-resident snapshot is credited
     // at start_binding), then a root start.
     std::vector<SourceCandidate> hybrid_sources(const RequestBasePlan& base, std::uint32_t maximum_frontier) {
+        // Admission estimates KV growth from the backed pool and expert frames. While
+        // asleep both are trimmed: quoting before wake can reject a retained snapshot
+        // and permanently choose a root prefill even though binding restores the room.
+        wake_expert_cache_if_asleep();
         const BasePlanImpl& b = *base.impl_;
         const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         std::vector<SourceCandidate> out;
@@ -1301,6 +1317,9 @@ public:
         if (index >= options_.max_concurrency || lanes_[index].phase != Phase::Free || in_transaction()) {
             throw std::logic_error("Qwen4Exp: the binding destination is not free");
         }
+        // Binding can encode vision and restore prefix state BEFORE the first round. No
+        // operation that may read weights or use scratch may reach an unmapped address.
+        wake_expert_cache_if_asleep();
         // A request paused after its first token binds its ledger; one paused inside its prompt binds
         // the prompt again, from the deepest cached state (its pause published the frontier).
         if (resume != nullptr && resume->impl_->generated) { return bind_replay(*base.impl_, index, *resume->impl_); }
@@ -2505,9 +2524,14 @@ private:
             std::chrono::duration_cast<Clock::duration>(std::chrono::seconds(sleep_after_seconds_)).count();
         return idle >= after;
     }
-    // At a boundary with the execution lock held and nothing in flight: releases every frame the
-    // keep floor does not need. The pools' arenas keep their addresses, so nothing is reloaded.
+    // At an idle execution boundary: all streams settled, no lanes live, no leases outstanding.
+    // Addresses and graphs survive; scratch is disposable and immutable weights have a RAM mirror.
     void sleep_expert_cache() {
+        // Quiesce every stream before the FIRST unmap, including free KV tails below.
+        CUDA_CHECK(cudaDeviceSynchronize());
+        // Only free, unreferenced page tails are trimmed. Do not evict prefix blocks just
+        // to reach a numeric floor: retained-context follow-ups remain exact and cheap.
+        if (sleep_work_) { shrink_kv(false, true); }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         if (sleep_asleep_.load() || !residency_) { return; }
         if (!residency_->elastic()) {
@@ -2517,15 +2541,10 @@ private:
         }
         const std::uint32_t before       = residency_->frames();
         const std::uint64_t bytes_before = residency_->pool_bytes();
-        if (before <= sleep_keep_frames_) {
-            sleep_asleep_.store(true);
-            return;
-        }
-        device_.synchronize();
         // Preserve the ranking so the awake cache can be reseeded with its hottest experts.
         sleep_state_ = residency_->saved_state();
         const auto start   = Clock::now();
-        const auto resized = residency_->resize(sleep_keep_frames_, device_.stream, *vram_);
+        const auto resized = residency_->resize(std::min(before, sleep_keep_frames_), device_.stream, *vram_);
         if (resized.frames > sleep_keep_frames_) {
             diagnostic("expert-cache sleep deferred: a lease holds the frames");
             return;
@@ -2533,7 +2552,17 @@ private:
         sleep_frames_awake_ = before;
         frames_now_         = resized.frames;
         pool_now_           = residency_->pool_bytes();
+        const auto scratch_bytes = (sleep_work_ ? sleep_work_->mapped_bytes() : 0) +
+                                   (sleep_staging_ ? sleep_staging_->mapped_bytes() : 0);
+        auto* weights = parameters_.model.sleepable_weights();
+        const auto weight_bytes = weights ? weights->mapped_bytes() : 0;
+        // Publish before the first unmap: even a failed transition must take the wake barrier.
         sleep_asleep_.store(true);
+        if (sleep_work_) { sleep_work_->sleep(); }
+        if (sleep_staging_) { sleep_staging_->sleep(); }
+        if (weights) { weights->sleep(); }
+        diagnostic("sleep memory asleep | scratch " + std::to_string(scratch_bytes >> 20) +
+                   " MiB | weights " + std::to_string(weight_bytes >> 20) + " MiB | KV and state retained");
         const std::uint64_t released = bytes_before > pool_now_ ? bytes_before - pool_now_ : 0;
         char part[96];
         std::snprintf(part, sizeof(part), " | %.2f s | free VRAM %llu MiB",
@@ -2542,14 +2571,30 @@ private:
         diagnostic("expert cache asleep | frames " + std::to_string(before) + " -> " + std::to_string(resized.frames) +
                    " | released " + std::to_string(released >> 20) + " MiB" + part);
     }
-    // Gives the frames back at the keep floor's expense: the chunks are remapped empty and the
-    // cache refills from the pinned host copies as the round routes its experts.
+    // Essential memory is restored FIRST. Only then can the optional cache take spare VRAM.
     void wake_expert_cache(const char* reason) {
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         if (!sleep_asleep_.load() || !residency_) { return; }
         const auto start           = Clock::now();
         const std::uint32_t target = std::min(sleep_frames_awake_, residency_->frame_limit());
         device_.synchronize(); // the round's own work has not been enqueued yet; earlier work is done
+        auto* weights = parameters_.model.sleepable_weights();
+        if ((weights && !weights->wake(device_.stream)) ||
+            (sleep_work_ && !sleep_work_->wake(device_.stream)) ||
+            (sleep_staging_ && !sleep_staging_->wake(device_.stream))) {
+            // The addresses remain reserved and the mirror survives: a later request may retry.
+            throw runtime::RecoverableExecutionError("sleep wake: not enough VRAM for resident weights and scratch");
+        }
+        if (kv_vmm_ && pool_->backed_pages() < plan_.kv_base_pages) {
+            const auto before = kv_vmm_->mapped_bytes();
+            if (!map_kv(plan_.kv_base_pages)) {
+                throw runtime::RecoverableExecutionError("sleep wake: not enough VRAM for initial KV backing");
+            }
+            pool_->set_backed_pages(plan_.kv_base_pages);
+            if (control_) { control_->account_fixed(static_cast<std::int64_t>(kv_vmm_->mapped_bytes() - before)); }
+        }
+        const double essentials = std::chrono::duration<double>(Clock::now() - start).count();
+        diagnostic("sleep memory awake | essential restore " + std::to_string(essentials) + " s");
         const auto resized         = residency_->resize(target, device_.stream, *vram_);
         frames_now_                = resized.frames;
         pool_now_                  = residency_->pool_bytes();
@@ -2563,7 +2608,8 @@ private:
             sleep_state_.reset();
         }
         const bool awake           = resized.frames > sleep_keep_frames_;
-        sleep_asleep_.store(!awake);
+        // Even zero expert frames is usable through the existing host/staging fallback.
+        sleep_asleep_.store(false);
         note_round_activity();
         char part[96];
         std::snprintf(part, sizeof(part), " | %.3f s", std::chrono::duration<double>(Clock::now() - start).count());
@@ -2582,8 +2628,13 @@ private:
         sleep_keep_frames_   = static_cast<std::uint32_t>(sleep_env_count("INFERNIX_SLEEP_KEEP_FRAMES"));
         sleep_busy_at_.store(Clock::now().time_since_epoch().count());
         if (sleep_after_seconds_ != 0) {
+            if (auto* weights = parameters_.model.sleepable_weights()) {
+                weights->capture(device_.stream);
+            }
             diagnostic("expert-cache sleep armed | release after " + std::to_string(sleep_after_seconds_) +
-                       " idle s | keep " + std::to_string(sleep_keep_frames_) + " frames");
+                       " idle s | keep " + std::to_string(sleep_keep_frames_) + " frames | scratch " +
+                       (sleep_work_ ? "on" : "off") + " | weights " +
+                       (parameters_.model.sleepable_weights() ? "on" : "off"));
         }
         const VramSnapshot now = vram_->query();
         if (residency_->elastic()) {
@@ -2607,6 +2658,7 @@ private:
     void on_vram_snapshot(const VramSnapshot& snapshot) {
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         if ((kv_idle_due() || sleep_due()) && waker_) { waker_(); }
+        if (sleep_asleep_.load()) { return; } // sleep is not permission to regrow the cache
         if (control_) {
             const auto d = control_->decide(snapshot, pool_now_, frames_now_, vram_seconds(), true);
             if ((d.shrink || d.grow) && waker_) { waker_(); }
@@ -2922,7 +2974,9 @@ public:
                 return;
             }
             if (!idle) { note_round_activity(); }
-            if (idle && sleep_due()) {
+            if (idle && sleep_due() && !wide_active_ && !walk_.active &&
+                !work_lease_.valid() && !stream_lease_.valid() &&
+                std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; })) {
                 sleep_expert_cache();
                 return;
             }
@@ -4732,6 +4786,9 @@ private:
     // its resume frontier: what a later prompt diverging further along re-prefills without it.
     static constexpr std::uint32_t kBranchTapMinTokens = 1024;
     DeviceBuffer state_backing_, ple_backing_, tails_backing_, kv_backing_, staging_;
+    [[nodiscard]] void* staging_data() const noexcept {
+        return sleep_staging_ ? sleep_staging_->span().data : staging_.p;
+    }
     // The vq2/k4v2 exact window (design §19.3.15), every KV layer and lane.
     DeviceBuffer window_backing_;
     prefix::KvWindowGeometry window_geometry_;
@@ -4749,8 +4806,8 @@ private:
         double rate = options_.link_bytes_per_second;
         const void* source = parameters_.layers.front().moe.bank->planes.records;
         if (source == nullptr && tier_) { source = tier_->slot_bytes(0); }
-        if (rate <= 0.0 && source != nullptr && staging_.p != nullptr && plan_.staging > 0) {
-            rate = measure_h2d_bytes_per_second(source, staging_.p, plan_.staging, 3);
+        if (rate <= 0.0 && source != nullptr && staging_data() != nullptr && plan_.staging > 0) {
+            rate = measure_h2d_bytes_per_second(source, staging_data(), plan_.staging, 3);
         }
         if (rate <= 0.0) { return; } // no frames to probe with: keep the reference rate
         link_bytes_per_second_ = rate;
@@ -4921,18 +4978,20 @@ private:
     // the index's order (nothing is lost: a later match restores them from the Host tier), so a long
     // conversation that has ended gives its memory back to the frames. The delay keeps a follow-up
     // turn from paying a restore and an expert reload for memory the idle gap never used.
-    void shrink_kv(bool evict = false) {
-        if (!kv_vmm_ || pool_->backed_pages() <= plan_.kv_base_pages) { return; }
+    void shrink_kv(bool evict = false, bool sleeping = false) {
+        const std::uint32_t floor = sleeping ? 0U : plan_.kv_base_pages;
+        if (!kv_vmm_ || pool_->backed_pages() <= floor) { return; }
         if (evict && prefix_) {
             runtime::prefix_cache::PrefixCacheIndex& index = prefix_->index();
             for (std::uint32_t budget = pool_->backed_pages() - plan_.kv_base_pages;
                  budget != 0 && !pool_->can_back(plan_.kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {}
         }
         std::uint32_t target = pool_->backed_pages();
-        while (target > plan_.kv_base_pages && pool_->can_back(target - std::min(target, kKvGrowPages))) {
-            target -= std::min(target, kKvGrowPages);
+        const std::uint32_t step = sleeping ? 1U : kKvGrowPages;
+        while (target > floor && pool_->can_back(target - std::min(target - floor, step))) {
+            target -= std::min(target - floor, step);
         }
-        target = std::max(target, plan_.kv_base_pages);
+        target = std::max(target, floor);
         if (target == pool_->backed_pages()) { return; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         device_.synchronize();
@@ -4948,7 +5007,7 @@ private:
         const std::uint32_t frames = residency_->frames();
         // While the cache sleeps the freed KV memory stays released: handing it to the frames would
         // map them back and undo part of the sleep.
-        if (!sleep_asleep_.load()) {
+        if (!sleeping && !sleep_asleep_.load()) {
             (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
         }
         if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
@@ -5066,6 +5125,8 @@ private:
     std::unique_ptr<DeviceKVPagePool> pool_;
     std::unique_ptr<KVExecutionTablePool> tables_;
     std::size_t work_capacity_ = 0;
+    // Backing outlives its non-owning workspace and Forward borrowers (reverse destruction).
+    std::unique_ptr<SleepableBuffer> sleep_work_, sleep_staging_;
     std::unique_ptr<WorkspaceArena> work_;
     // SSD tier mode (design §19.3.7): the fetch channel and the tier outlive everything that reads
     // their memory (the residency's promotion copies, the stream, the CPU service), declared later.

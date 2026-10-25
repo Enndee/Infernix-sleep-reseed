@@ -348,6 +348,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         throw ArtifactError("device backing exceeds size_t");
     }
     std::byte* device_base = nullptr;
+    if (plan.sleepable_device && eviction_pool) {
+        throw ArtifactError("sleepable weights cannot share a vision eviction pool");
+    }
     if (eviction_pool) {
         // Overlay mode: the weights arena is the pool's VMM home mapping, so the
         // evictable tail can be remapped out from under the device pointers.
@@ -357,6 +360,10 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         device_base = static_cast<std::byte*>(arena.data);
         out.eviction_pool_ = std::move(eviction_pool);
+    } else if (plan.device_capacity_bytes && plan.sleepable_device) {
+        out.sleepable_device_ = std::make_unique<SleepableBuffer>(
+            static_cast<std::size_t>(plan.device_capacity_bytes), device.device);
+        device_base = static_cast<std::byte*>(out.sleepable_device_->span().data);
     } else if (plan.device_capacity_bytes) {
         out.arena_ =
             std::make_unique<DeviceArena>(static_cast<std::size_t>(plan.device_capacity_bytes));

@@ -47,6 +47,10 @@ infernix_add_test(infernix_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/
 infernix_add_test(infernix_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES infernix_core)
 
+infernix_add_test(infernix_sleepable_buffer_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_sleepable_buffer.cpp"
+  LIBRARIES infernix_core)
+set_tests_properties(infernix_sleepable_buffer_test PROPERTIES SKIP_RETURN_CODE 77)
+
 infernix_add_test(infernix_layout_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_layout.cpp"
   LIBRARIES infernix_core)
 

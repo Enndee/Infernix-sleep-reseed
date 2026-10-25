@@ -111,7 +111,7 @@ void ProgramImpl::measure_cpu_rate(std::uint64_t record_stride) {
             for (int repeat = 0; repeat < kRepeats; ++repeat) {
                 for (int i = 0; i < kLoadCopies; ++i) {
                     const auto& first = held.front();
-                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_.p) + (i % kStagingSlots) * record_stride,
+                    CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(staging_data()) + (i % kStagingSlots) * record_stride,
                                                record_of(0, first[static_cast<std::size_t>(i) % first.size()]),
                                                source_stride, cudaMemcpyHostToDevice, stream));
                 }

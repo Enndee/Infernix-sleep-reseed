@@ -11,6 +11,7 @@ add_library(infernix_core STATIC
   copy_batch.cpp
   evictable_weight_pool.cu
   vmm_arena.cu
+  sleepable_buffer.cpp
   device.cu
   direct_read_queue.cpp
   dtype.cpp

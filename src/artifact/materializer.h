@@ -5,6 +5,7 @@
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
 #include "core/host_memory.h"
+#include "core/sleepable_buffer.h"
 #include "core/weight_view.h"
 #include "infernix/types.h"
 
@@ -56,6 +57,8 @@ struct MaterializationPlan {
     // Arena suffix holding the ranked (low-traffic) device weights that an
     // EvictableWeightPool may temporarily evict; chunk-aligned by finish().
     std::uint64_t evictable_tail_bytes = 0;
+    // Opt-in for Qwen4Exp idle sleep; incompatible with a vision eviction pool.
+    bool sleepable_device = false;
 };
 
 struct MaterializationStats {
@@ -138,6 +141,7 @@ public:
     }
 
     [[nodiscard]] const MaterializationStats& stats() const noexcept { return stats_; }
+    [[nodiscard]] SleepableBuffer* sleepable_device() const noexcept { return sleepable_device_.get(); }
 
 private:
     friend MaterializedArtifact materialize(const Reader&, MaterializationPlan&&, DeviceContext&,
@@ -152,6 +156,7 @@ private:
     };
 
     std::unique_ptr<DeviceArena> arena_;
+    std::unique_ptr<SleepableBuffer> sleepable_device_;
     std::unique_ptr<RegisteredHostBuffer> pinned_;
     std::unique_ptr<EvictableWeightPool> eviction_pool_;
     std::vector<ObjectStorage> objects_;
