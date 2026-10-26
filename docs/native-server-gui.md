@@ -127,8 +127,18 @@ portable server: it still drives exactly one local checkout.
 
 - Output: `dist\InfernixPanel-windows-x64\InfernixPanel\` containing
   `InfernixPanel.exe`, `_internal\`, `repo-root.txt`, `README.txt` and
-  `SHA256SUMS.txt`. `--onefile` produces a single executable instead, and
-  `--console` keeps diagnostic output visible.
+  `SHA256SUMS.txt`. `--console` keeps diagnostic output visible.
+- `--onefile` produces a single executable instead. Measured on 26 October 2026
+  with `--onefile --output dist\InfernixPanel-onefile`: 4 files, 12.7 MB total
+  (one 12.7 MB `InfernixPanel.exe` plus `repo-root.txt`, `README.txt`,
+  `SHA256SUMS.txt` beside it), 10.1 s build, and a detached
+  `--smoke-test-ui` launch that exits 0 with
+  `notification-area icon added=True`. Cold start is slower than the folder
+  build because every launch unpacks the bundle into a temporary `_MEI*`
+  directory: 3.1-4.4 s versus 2.0-2.1 s for the folder build on this machine.
+  Prefer the folder build for daily use; use `--onefile` only when a single
+  file must be moved around. Both variants resolve `repo-root.txt` from the
+  directory holding the executable, so the pointer file must travel with it.
 - Double-click launches work: a desktop shortcut is a plain `.lnk` whose target is
   `InfernixPanel.exe`, using the executable as icon source (it embeds
   `assets\qwen.ico`). With no arguments the panel opens its window, `--hidden`
