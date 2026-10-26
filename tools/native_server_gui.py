@@ -26,7 +26,76 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 
-REPO = Path(__file__).resolve().parents[1]
+def is_frozen() -> bool:
+    """True when this panel runs from a PyInstaller bundle instead of a checkout."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def bundle_dir() -> Path:
+    """Bundled data files: the tools directory from source, the bundle directory when frozen."""
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+
+def resolve_repo_root() -> Path:
+    """Locate the checkout this panel drives, for both source and frozen launches.
+
+    A frozen panel cannot derive its checkout from ``__file__``, so it reads the
+    ``INFERNIX_REPO`` environment variable first and then a ``repo-root.txt``
+    file next to the executable. Source launches keep the checkout-relative rule.
+    """
+    override = os.environ.get("INFERNIX_REPO", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    if is_frozen():
+        pointer = Path(sys.executable).resolve().parent / "repo-root.txt"
+        try:
+            recorded = pointer.read_text(encoding="utf-8").strip()
+        except OSError:
+            recorded = ""
+        if recorded:
+            return Path(recorded).expanduser().resolve()
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
+
+def ensure_console_streams() -> None:
+    """Give a windowed frozen panel working stdout/stderr; ``INFERNIX_PANEL_LOG`` keeps a log.
+
+    PyInstaller ``--noconsole`` builds have no console handles, so ``sys.stdout``
+    and ``sys.stderr`` are ``None`` and a plain ``print`` would raise there.
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    log_path = os.environ.get("INFERNIX_PANEL_LOG", "").strip()
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is not None:
+            continue
+        stream = None
+        if log_path:
+            try:
+                stream = open(log_path, "a", encoding="utf-8", buffering=1)
+            except OSError:
+                stream = None
+        if stream is None:
+            stream = open(os.devnull, "w", encoding="utf-8")
+        setattr(sys, name, stream)
+
+
+def self_launch_command(*flags: str) -> str:
+    """Sign-in command that reopens this panel, from a checkout or a frozen bundle."""
+    if is_frozen():
+        parts = [f'"{Path(sys.executable).resolve()}"']
+    else:
+        pythonw = Path(sys.executable)
+        if pythonw.name.lower() == "python.exe":
+            candidate = pythonw.with_name("pythonw.exe")
+            if candidate.is_file():
+                pythonw = candidate
+        parts = [f'"{pythonw}"', f'"{Path(__file__).resolve()}"']
+    return " ".join(parts + list(flags))
+
+
+REPO = resolve_repo_root()
 RUN_DIR = REPO / "build-baseline" / "native-run"
 GUI_SETTINGS = RUN_DIR / "gui-settings.json"
 RUNNER_CONFIG = RUN_DIR / "config.json"
@@ -46,13 +115,22 @@ PORT = 8011
 BASE_URL = f"http://{HOST}:{PORT}"
 DEFAULT_MODEL_ID = "Qwen3.8-Flash-Next-Uncensored-NVFP4-Infernix"
 KV_DTYPES = ("int8", "bf16", "fp8", "nvfp4", "k8v4", "vq2", "k4v2")
+# Single dark palette for ttk styles and the plain Tk text widgets.
+THEME_BG = "#1f2124"
+THEME_PANEL = "#2a2d31"
+THEME_FIELD = "#17191c"
+THEME_TEXT = "#e3e5e8"
+THEME_MUTED = "#98a0a8"
+THEME_ACCENT = "#5b9cf6"
+THEME_BORDER = "#3d4248"
+THEME_SELECT = "#2f5fa8"
 MAX_LOG_CHARS = 400_000
 MAX_HISTORY_ROWS = 300
 STARTUP_TIMEOUT_SECONDS = 900
 APP_NAME = "InfernixNativeServerGUI"
 WINDOW_CLASS = APP_NAME + "_" + hashlib.sha256(str(REPO).lower().encode("utf-8")).hexdigest()[:16]
 QWEN_AUTO_LOAD_APP_NAME = "InfernixExperimentalQwenAutoLoad"
-QWEN_ICON = Path(__file__).with_name("assets") / "qwen.ico"
+QWEN_ICON = bundle_dir() / "assets" / "qwen.ico"
 
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -89,6 +167,8 @@ def default_settings() -> dict[str, Any]:
         "vram_headroom_mib": 12288,
         "ram_headroom_mib": 24576,
         "kv_dtype": "int8",
+        "max_concurrency": 1,
+        "max_thinking_tokens": 512,
         "sleep_after_seconds": int(env.get("INFERNIX_SLEEP_AFTER_SECONDS", 15)),
         "sleep_keep_frames": int(env.get("INFERNIX_SLEEP_KEEP_FRAMES", 0)),
         "sleep_scratch": str(env.get("INFERNIX_SLEEP_SCRATCH", "1")) == "1",
@@ -118,6 +198,8 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
             "vram_headroom_mib": int(settings["vram_headroom_mib"]),
             "ram_headroom_mib": int(settings["ram_headroom_mib"]),
             "kv_dtype": str(settings["kv_dtype"]),
+            "max_concurrency": int(settings.get("max_concurrency", 1)),
+            "max_thinking_tokens": int(settings.get("max_thinking_tokens", 512)),
             "sleep_after_seconds": int(settings["sleep_after_seconds"]),
             "sleep_keep_frames": int(settings["sleep_keep_frames"]),
             "sleep_scratch": bool(settings["sleep_scratch"]),
@@ -127,12 +209,15 @@ def validate_settings(settings: dict[str, Any]) -> dict[str, Any]:
             "auto_load_qwen_at_login": bool(settings.get("auto_load_qwen_at_login", False)),
         }
     except (KeyError, TypeError, ValueError) as exc:
-        raise SettingsError("Enter whole numbers for context, headroom, and sleep settings.") from exc
+        raise SettingsError("Enter whole numbers for context, headroom, concurrency, thinking, and sleep settings.") from exc
     checks = (
         (1024 <= result["max_context"] <= 262144, "Context size must be between 1,024 and 262,144 tokens."),
         (0 <= result["vram_headroom_mib"] <= 32768, "VRAM headroom must be between 0 and 32,768 MiB."),
         (0 <= result["ram_headroom_mib"] <= 262144, "RAM headroom must be between 0 and 262,144 MiB."),
         (result["kv_dtype"] in KV_DTYPES, f"KV type must be one of: {', '.join(KV_DTYPES)}."),
+        (1 <= result["max_concurrency"] <= 8, "Maximum concurrency must be between 1 and 8 sequences."),
+        (0 <= result["max_thinking_tokens"] <= 4294967295,
+         "Maximum thinking tokens must be 0 (no explicit cap) or between 1 and 4,294,967,295."),
         (0 <= result["sleep_after_seconds"] <= 86400, "Idle sleep must be between 0 and 86,400 seconds."),
         (0 <= result["sleep_keep_frames"] <= 1048576, "Kept expert frames must be between 0 and 1,048,576."),
     )
@@ -170,13 +255,15 @@ def build_server_arguments(settings: dict[str, Any]) -> list[str]:
     arguments = [
         str(SERVER_EXE), str(MODEL), "--host", HOST, "--port", str(PORT),
         "--max-context", str(values["max_context"]), "--kv-dtype", values["kv_dtype"],
-        "--max-concurrency", "1", "--ram-headroom-mib", str(values["ram_headroom_mib"]),
+        "--max-concurrency", str(values["max_concurrency"]), "--ram-headroom-mib", str(values["ram_headroom_mib"]),
         "--vram-headroom-mib", str(values["vram_headroom_mib"]), "--expert-pin-mib", "auto",
         "--ngram-volume", str(NGRAM), "--ngram-residency", "volume",
         "--chat-template", str(TEMPLATE), "--expert-state", str(EXPERT_STATE),
         "--spec", "mtp", "--draft-tokens", "auto", "--lm-head-draft",
         "--vision", "--vision-offload", "on",
     ]
+    if values["max_thinking_tokens"] > 0:
+        arguments.extend(("--default-thinking-budget", str(values["max_thinking_tokens"])))
     return arguments
 
 
@@ -492,15 +579,10 @@ def set_startup_registration(enabled: bool, auto_load_qwen: bool = False) -> Non
         return
     import winreg
 
-    pythonw = Path(sys.executable)
-    if pythonw.name.lower() == "python.exe":
-        candidate = pythonw.with_name("pythonw.exe")
-        if candidate.is_file():
-            pythonw = candidate
     run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, run_key) as key:
         if enabled:
-            command = f'"{pythonw}" "{Path(__file__).resolve()}" --hidden'
+            command = self_launch_command("--hidden")
             winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command)
         else:
             try:
@@ -508,7 +590,7 @@ def set_startup_registration(enabled: bool, auto_load_qwen: bool = False) -> Non
             except FileNotFoundError:
                 pass
         if auto_load_qwen:
-            command = f'"{pythonw}" "{Path(__file__).resolve()}" --hidden --auto-load-qwen'
+            command = self_launch_command("--hidden", "--auto-load-qwen")
             winreg.SetValueEx(key, QWEN_AUTO_LOAD_APP_NAME, 0, winreg.REG_SZ, command)
         else:
             try:
@@ -838,6 +920,7 @@ class NativeServerGUI:
         self.monitor_thread: threading.Thread | None = None
         self.closed = False
         self.log_offsets: dict[Path, int] = {}
+        self._log_partial: dict[Path, str] = {}
         self.completed_rows: dict[str, dict[str, Any]] = {}
         self.total_output_tokens = 0
         self.total_decode_seconds = 0.0
@@ -853,14 +936,97 @@ class NativeServerGUI:
         if start_hidden and self.tray.added:
             self.root.withdraw()
 
-    def _build_ui(self) -> None:
+    def _apply_dark_theme(self) -> None:
+        """Apply one dark palette to ttk widgets and the plain Tk text surfaces."""
         style = ttk.Style(self.root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
+        if "clam" in style.theme_names():
+            # The Windows "vista" theme paints its own light surfaces and ignores colors.
+            style.theme_use("clam")
+        self.root.configure(bg=THEME_BG)
+        self.root.option_add("*TCombobox*Listbox.background", THEME_PANEL)
+        self.root.option_add("*TCombobox*Listbox.foreground", THEME_TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", THEME_SELECT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+        style.configure(
+            ".", background=THEME_BG, foreground=THEME_TEXT, fieldbackground=THEME_FIELD,
+            bordercolor=THEME_BORDER, lightcolor=THEME_PANEL, darkcolor=THEME_BG,
+            troughcolor=THEME_BG, focuscolor=THEME_ACCENT,
+            selectbackground=THEME_SELECT, selectforeground="#ffffff",
+        )
+        style.configure("TFrame", background=THEME_BG)
+        style.configure("TLabel", background=THEME_BG, foreground=THEME_TEXT)
+        style.configure("Footer.TLabel", background=THEME_BG, foreground=THEME_MUTED)
+        style.configure("TLabelframe", background=THEME_BG, bordercolor=THEME_BORDER)
+        style.configure("TLabelframe.Label", background=THEME_BG, foreground=THEME_ACCENT)
+        style.configure("TButton", background=THEME_PANEL, foreground=THEME_TEXT,
+                        bordercolor=THEME_BORDER, focuscolor=THEME_ACCENT, padding=(10, 4))
+        style.map("TButton",
+                  background=[("disabled", THEME_BG), ("pressed", THEME_SELECT), ("active", "#363a3f")],
+                  foreground=[("disabled", THEME_MUTED)])
+        style.configure("TNotebook", background=THEME_BG, bordercolor=THEME_BORDER, tabmargins=(2, 4, 2, 0))
+        style.configure("TNotebook.Tab", background=THEME_PANEL, foreground=THEME_MUTED, padding=(14, 6))
+        style.map("TNotebook.Tab", background=[("selected", THEME_BG)],
+                  foreground=[("selected", "#ffffff")])
+        style.configure("TCheckbutton", background=THEME_BG, foreground=THEME_TEXT,
+                        indicatorbackground=THEME_FIELD, indicatorforeground=THEME_ACCENT)
+        style.map("TCheckbutton", background=[("active", THEME_BG)],
+                  indicatorbackground=[("selected", THEME_ACCENT), ("active", THEME_FIELD)])
+        style.configure("TSpinbox", background=THEME_PANEL, foreground=THEME_TEXT,
+                        fieldbackground=THEME_FIELD, arrowcolor=THEME_TEXT, bordercolor=THEME_BORDER)
+        style.map("TSpinbox", fieldbackground=[("readonly", THEME_FIELD)],
+                  arrowcolor=[("disabled", THEME_MUTED)])
+        style.configure("TCombobox", background=THEME_PANEL, foreground=THEME_TEXT,
+                        fieldbackground=THEME_FIELD, arrowcolor=THEME_TEXT, bordercolor=THEME_BORDER)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", THEME_FIELD)],
+                  foreground=[("readonly", THEME_TEXT)],
+                  selectbackground=[("readonly", THEME_FIELD)],
+                  selectforeground=[("readonly", THEME_TEXT)],
+                  arrowcolor=[("disabled", THEME_MUTED)])
+        style.configure("Treeview", background=THEME_FIELD, fieldbackground=THEME_FIELD,
+                        foreground=THEME_TEXT, bordercolor=THEME_BORDER,
+                        lightcolor=THEME_BG, darkcolor=THEME_BG)
+        style.map("Treeview", background=[("selected", THEME_SELECT)],
+                  foreground=[("selected", "#ffffff")])
+        style.configure("Treeview.Heading", background=THEME_PANEL, foreground=THEME_TEXT,
+                        bordercolor=THEME_BORDER, relief="flat", padding=(6, 4))
+        style.map("Treeview.Heading", background=[("active", "#363a3f")])
+        for orientation in ("Vertical", "Horizontal"):
+            style.configure(f"{orientation}.TScrollbar", background=THEME_PANEL, troughcolor=THEME_BG,
+                            bordercolor=THEME_BORDER, arrowcolor=THEME_TEXT,
+                            darkcolor=THEME_PANEL, lightcolor=THEME_PANEL)
+            style.map(f"{orientation}.TScrollbar",
+                      background=[("active", "#3f444a"), ("pressed", THEME_SELECT)])
+
+    def _apply_dark_titlebar(self) -> None:
+        """Ask DWM for a dark caption bar; ignored on Windows builds without the attribute."""
+        if os.name != "nt":
+            return
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            dwmapi = ctypes.WinDLL("dwmapi")
+            user32.GetParent.argtypes = [ctypes.c_void_p]
+            user32.GetParent.restype = ctypes.c_void_p
+            self.root.update_idletasks()
+            hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            dwmapi.DwmSetWindowAttribute.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                                     ctypes.c_void_p, ctypes.c_uint]
+            dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+            enabled = ctypes.c_int(1)
+            # 20 is DWMWA_USE_IMMERSIVE_DARK_MODE; 19 is the pre-20H1 attribute number.
+            for attribute in (20, 19):
+                if dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(enabled),
+                                                ctypes.sizeof(enabled)) == 0:
+                    break
+        except (OSError, AttributeError, TypeError, ctypes.ArgumentError):
+            pass
+
+    def _build_ui(self) -> None:
+        self._apply_dark_theme()
 
         header = ttk.Frame(self.root, padding=(14, 12, 14, 8))
         header.pack(fill="x")
-        self.status_dot = tk.Label(header, text="●", fg="#d89b24", font=("Segoe UI", 15))
+        self.status_dot = tk.Label(header, text="●", fg="#e0a33a", bg=THEME_BG, font=("Segoe UI", 15))
         self.status_dot.pack(side="left", padx=(0, 7))
         self.status_var = tk.StringVar(value=self.last_server_state)
         ttk.Label(header, textvariable=self.status_var, font=("Segoe UI", 11, "bold")).pack(side="left")
@@ -891,8 +1057,9 @@ class NativeServerGUI:
         ttk.Label(
             self.root,
             text="Experimental instance only · fixed loopback port 8011 · closing this window hides it in the notification area",
-            anchor="w", padding=(14, 4),
+            anchor="w", padding=(14, 4), style="Footer.TLabel",
         ).pack(fill="x")
+        self._apply_dark_titlebar()
 
     def _build_activity_tab(self) -> None:
         summary = ttk.LabelFrame(self.activity_tab, text="Completed requests", padding=8)
@@ -912,9 +1079,16 @@ class NativeServerGUI:
         self.history.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
 
-        log_frame = ttk.LabelFrame(self.activity_tab, text="Native server logs (stdout + stderr)", padding=6)
+        log_frame = ttk.LabelFrame(self.activity_tab, text="Native server log", padding=6)
         log_frame.pack(fill="both", expand=True, pady=(10, 0))
-        self.log_text = tk.Text(log_frame, wrap="none", height=17, state="disabled", font=("Cascadia Mono", 9))
+        # Word wrap keeps long engine lines readable without a horizontal scrollbar.
+        self.log_text = tk.Text(
+            log_frame, height=17, state="disabled", font=("Cascadia Mono", 9),
+            wrap="word", bg=THEME_FIELD, fg=THEME_TEXT, insertbackground=THEME_TEXT,
+            selectbackground=THEME_SELECT, selectforeground="#ffffff",
+            relief="flat", borderwidth=0, padx=8, pady=6,
+            highlightthickness=1, highlightbackground=THEME_BORDER, highlightcolor=THEME_ACCENT,
+        )
         self.log_text.pack(side="left", fill="both", expand=True)
         yscroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         yscroll.pack(side="right", fill="y")
@@ -927,7 +1101,13 @@ class NativeServerGUI:
             wraplength=970, justify="left",
         ).pack(anchor="w", pady=(0, 8))
         ttk.Label(self.prompt_tab, text="Prompt").pack(anchor="w")
-        self.prompt_input = tk.Text(self.prompt_tab, height=7, wrap="word", font=("Segoe UI", 10))
+        self.prompt_input = tk.Text(
+            self.prompt_tab, height=7, wrap="word", font=("Segoe UI", 10),
+            bg=THEME_FIELD, fg=THEME_TEXT, insertbackground=THEME_TEXT,
+            selectbackground=THEME_SELECT, selectforeground="#ffffff",
+            relief="flat", borderwidth=0, padx=8, pady=6,
+            highlightthickness=1, highlightbackground=THEME_BORDER, highlightcolor=THEME_ACCENT,
+        )
         self.prompt_input.pack(fill="x", pady=(4, 8))
         actions = ttk.Frame(self.prompt_tab)
         actions.pack(fill="x")
@@ -939,7 +1119,13 @@ class NativeServerGUI:
         self.prompt_rate_var = tk.StringVar(value="Observed output rate: —")
         ttk.Label(actions, textvariable=self.prompt_rate_var, font=("Segoe UI", 10, "bold")).pack(side="right")
         ttk.Label(self.prompt_tab, text="Streaming response").pack(anchor="w", pady=(12, 3))
-        self.prompt_output = tk.Text(self.prompt_tab, height=20, wrap="word", state="disabled", font=("Segoe UI", 10))
+        self.prompt_output = tk.Text(
+            self.prompt_tab, height=20, wrap="word", state="disabled", font=("Segoe UI", 10),
+            bg=THEME_FIELD, fg=THEME_TEXT, insertbackground=THEME_TEXT,
+            selectbackground=THEME_SELECT, selectforeground="#ffffff",
+            relief="flat", borderwidth=0, padx=8, pady=6,
+            highlightthickness=1, highlightbackground=THEME_BORDER, highlightcolor=THEME_ACCENT,
+        )
         self.prompt_output.pack(fill="both", expand=True)
 
     def _build_settings_tab(self) -> None:
@@ -947,17 +1133,19 @@ class NativeServerGUI:
         form.pack(anchor="nw", fill="x")
         self.setting_vars: dict[str, tk.Variable] = {}
         integer_settings = [
-            ("max_context", "Context size (tokens)", 262144),
-            ("vram_headroom_mib", "VRAM headroom target (MiB)", 12288),
-            ("ram_headroom_mib", "Host RAM headroom (MiB)", 24576),
-            ("sleep_after_seconds", "Idle sleep after (seconds; 0 = disabled)", 86400),
-            ("sleep_keep_frames", "Expert frames to keep while asleep", 1048576),
+            ("max_context", "Context size (tokens)", 0, 262144),
+            ("vram_headroom_mib", "VRAM headroom target (MiB)", 0, 12288),
+            ("ram_headroom_mib", "Host RAM headroom (MiB)", 0, 24576),
+            ("max_concurrency", "Maximum concurrent sequences (1-8)", 1, 8),
+            ("max_thinking_tokens", "Default thinking-token cap (0 = automatic)", 0, 4294967295),
+            ("sleep_after_seconds", "Idle sleep after (seconds; 0 = disabled)", 0, 86400),
+            ("sleep_keep_frames", "Expert frames to keep while asleep", 0, 1048576),
         ]
-        for row, (key, label, maximum) in enumerate(integer_settings):
+        for row, (key, label, minimum, maximum) in enumerate(integer_settings):
             ttk.Label(form, text=label).grid(row=row, column=0, sticky="w", padx=(0, 16), pady=6)
             variable = tk.StringVar(value=str(self.settings[key]))
             self.setting_vars[key] = variable
-            ttk.Spinbox(form, from_=0, to=maximum, increment=1, width=16, textvariable=variable).grid(
+            ttk.Spinbox(form, from_=minimum, to=maximum, increment=1, width=16, textvariable=variable).grid(
                 row=row, column=1, sticky="w", pady=6
             )
         row = len(integer_settings)
@@ -993,7 +1181,9 @@ class NativeServerGUI:
         buttons.grid(row=row, column=0, columnspan=2, sticky="w", pady=(12, 6))
         ttk.Button(buttons, text="Save settings", command=self.save_settings).pack(side="left")
         ttk.Button(buttons, text="Restore tested defaults", command=self.restore_defaults).pack(side="left", padx=7)
-        self.settings_note = tk.StringVar(value="Server flags apply on the next start. Sleep controls affect the experimental build only.")
+        self.settings_note = tk.StringVar(
+            value="Server flags apply on the next start. Higher concurrency allows more simultaneous sequences and may increase resource use. Thinking cap applies to thinking-enabled requests unless a request supplies its own budget. Sleep controls affect the experimental build only."
+        )
         ttk.Label(form, textvariable=self.settings_note, wraplength=760, justify="left").grid(
             row=row + 1, column=0, columnspan=3, sticky="w", pady=(8, 0)
         )
@@ -1021,9 +1211,12 @@ class NativeServerGUI:
                     data = stream.read().decode("utf-8", "replace")
                 self.log_offsets[path] = size
                 lines = data.splitlines()
+                if lines and not data.endswith(("\n", "\r")):
+                    # Hold an unterminated final line back so the first poll can complete it.
+                    self._log_partial[path] = lines.pop()
                 if len(lines) > 500:
                     lines = lines[-500:]
-                self._append_log("\n".join(f"[{path.name}] {line}" for line in lines) + ("\n" if lines else ""))
+                self._append_log("".join(f"{line}\n" for line in lines))
                 if path == STDERR_LOG:
                     for line in data.splitlines():
                         record = parse_server_request(line)
@@ -1031,6 +1224,7 @@ class NativeServerGUI:
                             self._record_server_request(record)
             except OSError:
                 self.log_offsets[path] = 0
+                self._log_partial.pop(path, None)
 
     def _append_log(self, text: str) -> None:
         if not text:
@@ -1075,14 +1269,21 @@ class NativeServerGUI:
                 offset = self.log_offsets.get(path, 0)
                 if size < offset:
                     offset = 0
+                    self._log_partial.pop(path, None)
                 if size == offset:
                     continue
                 with path.open("rb") as stream:
                     stream.seek(offset)
                     data = stream.read(1_000_000).decode("utf-8", "replace")
                     self.log_offsets[path] = stream.tell()
-                lines = data.splitlines()
-                self._append_log("".join(f"[{path.name}] {line}\n" for line in lines))
+                buffered = self._log_partial.get(path, "") + data
+                lines = buffered.splitlines()
+                if lines and not buffered.endswith(("\n", "\r")):
+                    # Keep a half-written trailing line until the next poll completes it.
+                    self._log_partial[path] = lines.pop()
+                else:
+                    self._log_partial[path] = ""
+                self._append_log("".join(f"{line}\n" for line in lines))
                 if path == STDERR_LOG:
                     for line in lines:
                         record = parse_server_request(line)
@@ -1487,6 +1688,7 @@ class NativeServerGUI:
 
 def main(argv: list[str] | None = None) -> int:
     global WINDOW_CLASS
+    ensure_console_streams()
     if os.name != "nt":
         print("The native notification-area control panel is Windows-only.", file=sys.stderr)
         return 2

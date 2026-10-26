@@ -29,6 +29,8 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings["vram_headroom_mib"], 12288)
         self.assertEqual(settings["ram_headroom_mib"], 24576)
         self.assertEqual(settings["kv_dtype"], "int8")
+        self.assertEqual(settings["max_concurrency"], 1)
+        self.assertEqual(settings["max_thinking_tokens"], 512)
         self.assertEqual(settings["sleep_after_seconds"], 15)
         self.assertTrue(settings["sleep_weights"])
         self.assertTrue(settings["sleep_kv"])
@@ -39,9 +41,50 @@ class SettingsTests(unittest.TestCase):
         arguments = gui.build_server_arguments(settings)
         self.assertEqual(arguments[arguments.index("--port") + 1], "8011")
         self.assertEqual(arguments[arguments.index("--max-context") + 1], "131072")
+        self.assertEqual(arguments[arguments.index("--max-concurrency") + 1], "1")
         self.assertEqual(arguments[arguments.index("--vram-headroom-mib") + 1], "8192")
         self.assertEqual(arguments[arguments.index("--kv-dtype") + 1], "fp8")
         self.assertEqual(arguments[arguments.index("--expert-state") + 1], str(gui.EXPERT_STATE))
+        self.assertEqual(arguments[arguments.index("--default-thinking-budget") + 1], "512")
+
+    def test_concurrency_setting_builds_server_argument_and_validates_range(self) -> None:
+        settings = gui.default_settings()
+        settings["max_concurrency"] = 2
+        arguments = gui.build_server_arguments(settings)
+        self.assertEqual(arguments[arguments.index("--max-concurrency") + 1], "2")
+
+        for value in (0, 9):
+            settings = gui.default_settings()
+            settings["max_concurrency"] = value
+            with self.subTest(value=value), self.assertRaises(gui.SettingsError):
+                gui.validate_settings(settings)
+
+    def test_concurrency_legacy_settings_default_to_single_sequence(self) -> None:
+        settings = gui.default_settings()
+        del settings["max_concurrency"]
+        self.assertEqual(gui.validate_settings(settings)["max_concurrency"], 1)
+
+    def test_thinking_token_cap_is_optional_and_added_to_server_command(self) -> None:
+        settings = gui.default_settings()
+        settings["max_thinking_tokens"] = 0
+        arguments = gui.build_server_arguments(settings)
+        self.assertNotIn("--default-thinking-budget", arguments)
+
+        settings["max_thinking_tokens"] = 512
+        arguments = gui.build_server_arguments(settings)
+        budget_index = arguments.index("--default-thinking-budget")
+        self.assertEqual(arguments[budget_index + 1], "512")
+
+    def test_thinking_token_cap_validation_and_legacy_settings(self) -> None:
+        settings = gui.default_settings()
+        del settings["max_thinking_tokens"]
+        self.assertEqual(gui.validate_settings(settings)["max_thinking_tokens"], 512)
+
+        for value in (-1, 4294967296):
+            settings = gui.default_settings()
+            settings["max_thinking_tokens"] = value
+            with self.subTest(value=value), self.assertRaises(gui.SettingsError):
+                gui.validate_settings(settings)
 
     def test_rejects_sleep_backing_without_idle_sleep(self) -> None:
         settings = gui.default_settings()
@@ -172,10 +215,18 @@ class StartupTests(unittest.TestCase):
             with patch.object(gui, "RUN_DIR", directory), patch.object(gui, "RUNNER_CONFIG", directory / "config.json"), \
                     patch.object(gui, "GUI_SETTINGS", directory / "gui-settings.json"):
                 settings = gui.default_settings()
-                settings.update(launch_at_login=True, auto_load_qwen_at_login=True)
+                settings.update(
+                    launch_at_login=True,
+                    auto_load_qwen_at_login=True,
+                    max_concurrency=2,
+                    max_thinking_tokens=512,
+                )
                 gui.write_startup_configuration(settings)
                 self.assertEqual(gui.load_settings(), settings)
                 self.assertEqual(json.loads(gui.RUNNER_CONFIG.read_text())["env"]["INFERNIX_SLEEP_WEIGHTS"], "1")
+                arguments = gui.build_server_arguments(gui.load_settings())
+                self.assertEqual(arguments[arguments.index("--max-concurrency") + 1], "2")
+                self.assertEqual(arguments[arguments.index("--default-thinking-budget") + 1], "512")
 
     def test_failed_startup_toggles_restore_previous_values(self) -> None:
         app = gui.NativeServerGUI.__new__(gui.NativeServerGUI)
@@ -384,6 +435,66 @@ class ActionSafetyTests(unittest.TestCase):
             kernel.WaitForSingleObject.assert_called_once_with(handle, 20_000)
             kernel.CloseHandle.assert_called_once_with(handle)
             self.assertEqual(unlink.call_count, int(expected))
+
+
+class LogAndThemeTests(unittest.TestCase):
+    def _app(self) -> tuple[gui.NativeServerGUI, list[str]]:
+        app = gui.NativeServerGUI.__new__(gui.NativeServerGUI)
+        app.root = MagicMock()
+        app.closed = False
+        app.log_offsets = {}
+        app._log_partial = {}
+        app._record_server_request = MagicMock()
+        captured: list[str] = []
+        app._append_log = captured.append
+        return app, captured
+
+    def test_recent_logs_have_no_stream_filename_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            stdout = directory / "infernix-serve.stdout.log"
+            stderr = directory / "infernix-serve.stderr.log"
+            stdout.write_text("", encoding="utf-8")
+            stderr.write_text("2026-10-26 19:43:03.931  INFO  engine | awake\n", encoding="utf-8")
+            app, captured = self._app()
+            with patch.object(gui, "STDOUT_LOG", stdout), patch.object(gui, "STDERR_LOG", stderr):
+                app._load_recent_logs()
+        self.assertEqual([text for text in captured if text],
+                         ["2026-10-26 19:43:03.931  INFO  engine | awake\n"])
+
+    def test_polled_logs_omit_filenames_and_never_emit_half_written_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            stdout = directory / "infernix-serve.stdout.log"
+            stderr = directory / "infernix-serve.stderr.log"
+            stdout.write_text("", encoding="utf-8")
+            stderr.write_text("first line\nsecond ", encoding="utf-8")
+            app, captured = self._app()
+            with patch.object(gui, "STDOUT_LOG", stdout), patch.object(gui, "STDERR_LOG", stderr):
+                app._poll_logs()
+                with stderr.open("a", encoding="utf-8") as stream:
+                    stream.write("line\n")
+                app._poll_logs()
+        self.assertEqual(captured, ["first line\n", "second line\n"])
+        self.assertNotIn("infernix-serve", "".join(captured))
+
+    def test_dark_theme_switches_to_clam_with_dark_palette(self) -> None:
+        app = gui.NativeServerGUI.__new__(gui.NativeServerGUI)
+        app.root = MagicMock()
+        with patch.object(gui.ttk, "Style") as style_factory:
+            style = style_factory.return_value
+            style.theme_names.return_value = ["vista", "clam"]
+            app._apply_dark_theme()
+        style.theme_use.assert_called_once_with("clam")
+        app.root.configure.assert_called_with(bg=gui.THEME_BG)
+        style.configure.assert_any_call("TFrame", background=gui.THEME_BG)
+        style.configure.assert_any_call("TLabel", background=gui.THEME_BG, foreground=gui.THEME_TEXT)
+        style.configure.assert_any_call("Treeview", background=gui.THEME_FIELD,
+                                       fieldbackground=gui.THEME_FIELD, foreground=gui.THEME_TEXT,
+                                       bordercolor=gui.THEME_BORDER, lightcolor=gui.THEME_BG,
+                                       darkcolor=gui.THEME_BG)
+        style.map.assert_any_call("TNotebook.Tab", background=[("selected", gui.THEME_BG)],
+                                  foreground=[("selected", "#ffffff")])
 
 
 class MainTests(unittest.TestCase):

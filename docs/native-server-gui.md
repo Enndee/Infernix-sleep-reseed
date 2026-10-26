@@ -43,18 +43,44 @@ notification-area API; it adds no Python package dependencies.
 
 The Activity tab tails native stdout/stderr, parses every completed request's
 server-reported prompt/output token counts and prefill/decode tok/s, and shows a
-weighted aggregate decode rate. Prompt text is deliberately not written to the
+weighted aggregate decode rate. Log lines are shown as the server wrote them,
+without a stream filename prefix, and long lines wrap inside the view. The panel
+and log use a dark palette. Prompt text is deliberately not written to the
 native logs; requests sent from the GUI additionally show their prompt preview
 and an observed streamed-output tok/s rate computed from response usage tokens
 after the first text delta. Other API clients appear as server request IDs and
 token counts without their private prompt contents.
 
 The Settings tab exposes startup flags supported by this tested release: context,
-VRAM/RAM headroom, KV type, and experimental idle scratch/weight/KV
-sleep controls. KV offload defaults on in this panel; uncheck it to retain the
-older KV-resident sleep tier. It takes effect at the next server start, not when
-the checkbox is clicked. Restart an already open panel to load its new controls.
+VRAM/RAM headroom, KV type, maximum concurrency, a default thinking-token cap, and
+experimental idle scratch/weight/KV sleep controls. Maximum concurrency defaults
+to 1 and accepts 1-8 sequences; it is passed as `--max-concurrency`. Raising it
+allows the server to schedule more sequences concurrently, but can increase
+resource use. Start with 2 if you need two simultaneous generations. The default
+thinking cap is 512 tokens; set it to `0` for Infernix's automatic answer-room
+behavior instead. A positive cap is passed as `--default-thinking-budget` and
+applies to thinking-enabled requests unless that request supplies its own budget.
+All server settings take effect on the next server start/restart, not when a
+control is changed. Restart an already open panel to load updated GUI controls.
 The API listener stays fixed to loopback port 8011.
+
+The cap is an Infernix server-side numeric limit, not a conversion of Copilot's
+Thinking Effort selection. VS Code documents effort as controlling how much a
+model reasons and says higher effort produces more thinking tokens, but gives no
+fixed token-count mapping. For a Custom Endpoint model, `supportsReasoningEffort`
+can expose supported labels in VS Code's picker, and `reasoningEffortFormat` can
+forward them as the Chat Completions `reasoning_effort` field. Infernix accepts
+`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max` for this field;
+these remain effort hints, not numeric caps.
+
+The Custom Endpoint provider also supports `modelOptions`, an object of request
+parameters sent with every request. This can set fixed fields such as
+`reasoning_effort`, but VS Code does not document a dynamic per-request numeric
+thinking-budget setting. Infernix's OpenAI Chat Completions parser does not map
+an arbitrary numeric budget field to the thinking cap. Its Anthropic Messages
+API accepts `thinking.budget_tokens` per request, but requires at least 1,024
+tokens. Use this GUI's 512-token server default when an exact 512 cap is needed;
+an explicit per-request budget on a supported API can take precedence.
 
 Focused checks:
 
@@ -85,3 +111,44 @@ destroyed on exit; the shared Windows fallback icon is not. If tray setup fails,
 Validation on 26 October 2026: 28 focused unit tests, compilation, CLI smoke with
 both smoke/auto-load flags, and the native-event smoke passed. Actual Qwen loading
 and termination were deliberately not performed as part of the tray repair.
+
+## Standalone executable build
+
+`packaging/windows/build_panel_exe.py` freezes the panel with PyInstaller so it
+starts without the development Python environment. The frozen panel is not a
+portable server: it still drives exactly one local checkout.
+
+```powershell
+# PyInstaller is a build-time dependency of the environment Python only.
+& 'F:\Models\infernix-env\python.exe' -m pip install pyinstaller
+& 'F:\Models\infernix-env\python.exe' '<checkout>\packaging\windows\build_panel_exe.py'
+& '<checkout>\dist\InfernixPanel-windows-x64\InfernixPanel\InfernixPanel.exe' --smoke-test-ui
+```
+
+- Output: `dist\InfernixPanel-windows-x64\InfernixPanel\` containing
+  `InfernixPanel.exe`, `_internal\`, `repo-root.txt`, `README.txt` and
+  `SHA256SUMS.txt`. `--onefile` produces a single executable instead, and
+  `--console` keeps diagnostic output visible.
+- Double-click launches work: a desktop shortcut is a plain `.lnk` whose target is
+  `InfernixPanel.exe`, using the executable as icon source (it embeds
+  `assets\qwen.ico`). With no arguments the panel opens its window, `--hidden`
+  starts it minimized to the notification area. Recreate the shortcut if the
+  `dist\` folder is rebuilt elsewhere.
+- The build adds `tcl86t.dll` and `tk86t.dll` from the interpreter's `Library\bin`
+  explicitly. A conda `_tkinter.pyd` loads them from there, a directory
+  PyInstaller's binary analysis does not search, so an unpatched frozen panel
+  aborts with `ImportError: DLL load failed while importing _tkinter` (windowed
+  builds show that as a modal dialog and appear to hang).
+- `repo-root.txt` next to the executable, or the `INFERNIX_REPO` environment
+  variable, tells the frozen panel which checkout holds `build-baseline\native-run`
+  and `build-baseline\apps\Release\infernix-serve.exe`. Keep the file current if
+  either path moves.
+- A windowed build has no console handles. Set `INFERNIX_PANEL_LOG` to a file to
+  capture the panel's stdout/stderr.
+- Sign-in registration writes `InfernixPanel.exe --hidden` for a frozen panel and
+  `pythonw.exe "<script>" --hidden` for the source panel, both under the same
+  per-user `Run` value names. Use only one of the two launchers with the
+  start-with-Windows options enabled.
+- Rebuild after changing `tools/native_server_gui.py`; the executable contains a
+  frozen copy. The panel and the server are separate: `infernix-serve.exe` still
+  comes from `build-baseline\apps\Release`.
