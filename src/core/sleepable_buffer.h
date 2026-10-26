@@ -6,6 +6,9 @@
 #include <cuda_runtime.h>
 
 #include <memory>
+#include <functional>
+#include <utility>
+#include <vector>
 
 namespace infernix {
 
@@ -28,6 +31,35 @@ private:
     std::size_t bytes_;
     VmmArena arena_;
     std::unique_ptr<PinnedHostBuffer> mirror_;
+    bool asleep_ = false;
+};
+
+// Mutable, sparsely mapped storage (KV planes and execution tables). The owner must
+// quiesce every reader/writer before sleep and forbid access until wake succeeds.
+// Unlike immutable weights, the mirror is refreshed on EVERY sleep. The range's
+// mappings and all byte contents are restored, without changing page ownership or VA.
+class VmmRangeSnapshot {
+public:
+    // Optional allocator permits deterministic fault injection without exhausting
+    // the user's GPU. It must have VmmRange::map's all-or-nothing chunk contract.
+    using MapChunk = std::function<bool(std::size_t)>;
+    explicit VmmRangeSnapshot(VmmRange& range, MapChunk map_chunk = {})
+        : range_(range), map_chunk_(std::move(map_chunk)) {}
+    void sleep(cudaStream_t stream);
+    [[nodiscard]] bool wake(cudaStream_t stream);
+    [[nodiscard]] bool asleep() const noexcept { return asleep_; }
+    [[nodiscard]] std::size_t saved_bytes() const noexcept { return chunks_.size() * range_.chunk_bytes(); }
+
+private:
+    void release_mappings();
+    void copy_snapshot(cudaStream_t stream, bool to_host);
+    VmmRange& range_;
+    MapChunk map_chunk_;
+    std::vector<std::size_t> chunks_;
+    // Bound each pinned allocation: large single cudaHostAlloc calls can stall
+    // under WDDM. The aggregate high-water mirror is reused across sleeps.
+    static constexpr std::size_t kMirrorChunkBytes = 256ULL << 20;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> mirrors_;
     bool asleep_ = false;
 };
 

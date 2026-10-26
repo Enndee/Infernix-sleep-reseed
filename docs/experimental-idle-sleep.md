@@ -21,6 +21,7 @@ $env:INFERNIX_SLEEP_AFTER_SECONDS = '15'
 $env:INFERNIX_SLEEP_KEEP_FRAMES = '0'
 $env:INFERNIX_SLEEP_SCRATCH = '1'
 $env:INFERNIX_SLEEP_WEIGHTS = '1'
+$env:INFERNIX_SLEEP_KV = '1'
 ```
 
 - `INFERNIX_SLEEP_AFTER_SECONDS`: `0`/unset disables automatic sleep. Requires
@@ -36,9 +37,34 @@ $env:INFERNIX_SLEEP_WEIGHTS = '1'
   capture one exact pinned-host mirror before arming sleep. Requires additional RAM
   equal to the resident weight arena, allocated once. Does not read model files on
   wake. Host expert banks and pinned vision weights are unchanged.
+- `INFERNIX_SLEEP_KV=1`: snapshot all mapped elastic KV planes and execution
+  tables into pinned RAM on **every** idle transition, then release their physical
+  GPU backing. Cached-prefix leases, page IDs and virtual addresses stay intact.
+  RAM use follows the high-water mapped KV size (256 MiB maximum per pinned
+  allocation); the same buffers are reused. Requires the monitor, a nonzero sleep
+  threshold and page-major elastic VMM KV. It is independent of scratch/weight
+  sleep and defaults off in the engine. The optional native control panel exposes
+  it as an enabled-by-default checkbox for the experimental launcher.
+- `INFERNIX_SLEEP_WAKE_SEED_MAX`: with KV offload, caps the optional hot-expert
+  reseed on wake (default **1024** experts, `0` skips reseeding). It still cannot
+  exceed half the restored frames. Misses refill through the normal expert path;
+  this moves optional transfers off the first-token critical path. Without KV
+  offload the historical half-cache reseed is unchanged. This is not a latency
+  guarantee; restored KV size, prefill work and GPU contention still matter.
+- `INFERNIX_SLEEP_WAKE_FRAMES`: with KV offload, caps initial wake cache capacity
+  (default **4096** frames, never below the configured sleep keep floor). Empty
+  expert frames are not conversation state. The existing VRAM controller can
+  grow the cache later using its normal delay; large prefills can still lend
+  workspace from the restored frames. This avoids eagerly remapping a full
+  pre-sleep expert cache before answering. Legacy sleep without KV offload keeps
+  its prior full-capacity restore behavior.
+  With a snapshot of at least 2 GiB, the initial cap is additionally limited to
+  2048 frames to make room in the wake latency budget for essential KV transfers.
+  Adjacent KV chunks are copied as contiguous runs, splitting at sparse holes or
+  256 MiB host slab boundaries; they do not each require a separate DMA submission.
 
-Each backing option is independent; keep both new settings unset/zero for the previous
-expert-only behavior. Both new settings use the *same* sleep threshold, not a second
+Each backing option is independent; keep all backing settings unset/zero for the previous
+expert-only behavior. The settings use the *same* sleep threshold, not a second
 delayed deep-sleep tier. No memory is unmapped while any lane or borrowed frame
 lease is live. The execution boundary explicitly synchronizes all CUDA streams.
 
@@ -46,7 +72,7 @@ Scratch backing is enabled only with the monitor and a nonzero idle threshold.
 The weight option is consumed earlier, during model materialization: setting it
 alone still selects VMM backing and reserves the later pinned-memory budget, even
 if automatic sleep is disabled. The mirror is captured when sleep is armed. To
-restore the default allocation path, unset **both** backing options and the idle
+restore the default allocation path, unset **all three** backing options and the idle
 threshold before restarting the server. Startup does not silently fall back when
 explicitly requested VMM backing is unavailable. Sleepable materialization cannot
 share a vision eviction pool; host-resident/offloaded vision weights are unchanged.
@@ -68,26 +94,36 @@ existing materialization path.
 
 At an idle execution boundary, sleep:
 
-1. Calls `cudaDeviceSynchronize()` **before the first unmap**, including KV tails.
+1. Drains pending prefix captures when KV offload is enabled, then calls
+   `cudaDeviceSynchronize()` **before the first unmap**, including KV tails.
    The compute-stream-only `DeviceContext::synchronize()` is insufficient here.
 2. Trims only unreferenced KV tails below the normal startup floor when scratch
-   sleep is enabled; it does not evict retained prefixes to meet a numeric target.
+   or KV sleep is enabled; it does not evict retained prefixes to meet a numeric target.
 3. Saves the expert ranking/counts, releases frames down to the keep floor, and
    defers the transition if outstanding leases prevent the requested release.
 4. Publishes the asleep state before unmapping scratch, staging and weights, so
    even a partially failed transition must pass the wake barrier before access.
+5. With KV offload, copies a fresh, synchronized snapshot before unmapping any
+   retained KV chunk. Host allocation/copy failure before unmap leaves KV resident
+   and logs the incomplete offload. A partial unmap remains asleep and must restore.
 
-On wake, resident weights, scratch, staging and the normal KV floor are restored
+On wake, the saved KV mappings/bytes, resident weights, scratch, staging and normal KV floor are restored
 **before** optional expert growth/reseeding. `SleepableBuffer` rolls back its own
 new mappings on allocation failure and remains asleep. Essential allocation
 failure prevents inference and raises a recoverable execution error; the virtual
-addresses and mirror remain available for a later retry. Allocation-failure
-injection has not been qualified. A partial/zero expert-cache restore is distinct
+addresses and mirror remain available for a later retry. The mutable KV snapshot
+has deterministic allocation-failure and exception injection tests: partial new
+mappings are removed, the RAM image survives, and a later retry restores all bytes.
+This tests the storage primitive, not HTTP-level recovery from actual GPU exhaustion.
+A partial/zero expert-cache restore is distinct
 from essential-buffer failure and retains the host/staging fallback.
 
 `SleepableBuffer` is not a synchronizing allocator: callers must serialize
 transitions and quiesce every stream using the storage before `sleep()`. Capturing
 an immutable mirror is one-time; later `capture()` calls do not refresh it.
+`VmmRangeSnapshot` is separate: it refreshes mutable bytes every time. KV restore
+precedes `map_kv()` because the latter zero-initializes newly mapped chunks. Idle
+maintenance cannot shrink or evict an offloaded pool while it is asleep.
 
 Essential weights, scratch and normal KV backing restore **before** expert-cache
 growth/reseeding and before source selection/admission, not just request binding
@@ -101,15 +137,21 @@ expert frames remains supported by the existing host/staging path.
 
 ## Evidence and diagnostics
 
-`sleep memory asleep` records separately released scratch and resident-weight MiB.
+`sleep memory asleep` records separately released scratch, resident-weight and KV MiB.
 `sleep memory awake` records essential restore duration; `expert cache awake`
 includes that work plus expert remapping and reseeding. KV and recurrent/prefix
 state remain owned by their original pools. Desktop/system usage is not the same
 as the server's process-owned dedicated VRAM.
+`sleep allocation inventory` reports the device plan's KV, recurrent/state, IO/
+speculation and expert-metadata categories; graph/runtime overhead is not included
+in those plan figures and is not claimed to be offloaded.
 
 Focused test target: `infernix_sleepable_buffer_test`. It checks five cycles of
 physical release, identical pointers, exact mirrored contents including a partial
 last chunk, scratch writes, and replay of the *same* pre-sleep CUDA graph executable.
+It also checks mutable sparse snapshots through five changing cycles, growth and
+holes, empty/idempotent transitions, pre-sleep graph replay, failed partial-restore
+rollback/retry, and a 260 MiB multi-slab snapshot with an exact all-byte comparison.
 Existing arena/decode-graph/KV tests should run alongside it.
 
 In a configured, test-enabled Windows build tree:
@@ -139,6 +181,69 @@ TTFT (HTTP dispatch through first content), not native TTFT with wake omitted.
 Do not claim general 262K-context, vision, concurrency, or long-conversation
 qualification from a short-prompt latency benchmark. Preserve incomplete runs and
 report interference rather than selecting only favorable samples.
+
+## KV-offload qualification - 26 October 2026
+
+Local Windows RTX 5090 run: INT8 KV, 262144 configured context, one lane, MTP,
+volume n-gram residency, offloaded vision weights (no vision requests), 3288 MiB
+VRAM headroom and 24576 MiB RAM headroom, one-second idle threshold. Production
+ports were not controlled. Sequential workstation runs are not randomized trials.
+
+Final fixed-context campaign: six actual sleep/wake requests and six immediate
+warm controls per row. Thinking disabled, greedy output; exact output equality
+and explicit cached-token assertions passed. First-token timing includes HTTP,
+wake, admission and remaining prefill; it is not complete-answer time.
+
+| Prompt tokens | Reused tokens | KV released at sleep | Median first token | Full first-token range | Idle process dedicated VRAM |
+|---:|---:|---:|---:|---:|---:|
+| 42 | 0 | 2 MiB | 867 ms | 834–879 ms | 830–856 MiB |
+| 5162 | 5120 | 184 MiB | 842 ms | 793–879 ms | 856 MiB |
+| 32362 | 32320 | 560 MiB | 851 ms | 829–859 ms | 857 MiB |
+| 68062 | 68032 | 1022 MiB | 815 ms | 780–926 ms | 858 MiB |
+| 136062 | 136032 | 2004 MiB | 886 ms | 870–898 ms | 860 MiB |
+| 255062 | 255024 | 3590 MiB | 951 ms | 939–961 ms | 863 MiB |
+
+All **36/36** final fixed-context first-token samples are below 1000 ms. The
+current-session old-sleep baseline had medians 1007/988/935 ms for 42/5162/32362
+tokens and idle memory 990/1044/1430 MiB. The smaller final wake cache changes
+performance as well as residency; do not attribute all timing changes to KV DMA.
+An earlier new-build near-limit run took **1051–1119 ms**; coalesced KV copies and
+a smaller multi-GiB wake frame allocation replaced it. Earlier 1022 ms short-prompt
+misses are also retained in the local evidence, not omitted from qualification.
+
+**The broader sub-second requirement is not universally satisfied.** Six evolving
+turns with only the system cache breakpoint preserved correct state but took
+986/1096/1160/1191/1197/1261 ms, then 1395 ms after 65 seconds idle. They reused
+5104 tokens but needed increasing uncached tail prefill. A separate per-turn
+breakpoint run took 1063/700/965/742/979/714 ms, with 987 ms after 65 seconds;
+its first sample still misses the target. These are separate workloads, not
+replacements for unfavorable results. Whole answers also exceed 1000 ms: the
+96-token short response took 2.14–2.29 seconds, and the 11-token near-limit
+response took 1.085–1.117 seconds. Cold first-time long prefill is not certified
+sub-second.
+
+Less expert reseeding and a smaller initial cache trade decode speed for lower
+first-token latency: final 96-token short-response post-sleep median decode was
+71.85 tok/s versus 100.95 in the old-sleep baseline. The runs are sequential,
+so this is a disclosed observed regression, not a controlled causal estimate.
+The existing controller may later regrow the cache. No all-workload speedup claim.
+
+Device-plan inventory at startup: 572 MiB KV backing, 120 MiB recurrent/state,
+53 MiB IO/speculation and 30 MiB expert metadata (MiB figures truncated).
+The remaining roughly 0.84 GiB process footprint includes allocations and
+CUDA graph/runtime overhead that are not offloaded; its exact residual split is
+not measured. Additional pinned KV mirror RAM follows the high-water mapped size
+(up to 3590 MiB in this test), separate from the existing weight mirror.
+
+Final CTest: **4/4 pass, no skips**; mutable snapshot tests include byte-exact
+growth/shrink, sparse planes, same pre-sleep graph, multi-slab copies and partial
+allocation/exception rollback followed by successful retry. GUI settings tests:
+**29 pass**, Python syntax and `git diff --check` pass. Changing conversations
+and the 65-second idle-shrink boundary passed correctness checks. Actual GPU
+exhaustion at the HTTP layer, concurrency, vision inference, Linux and long soak
+testing remain unqualified. Runtime/build artifacts and complete per-sample logs
+are retained locally under the ignored build tree; this section does not imply
+they were published or that the older upstream draft PR was updated.
 
 ## Measured results - 25 October 2026
 

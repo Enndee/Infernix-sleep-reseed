@@ -789,6 +789,12 @@ public:
         tables_ = std::make_unique<KVExecutionTablePool>(kv_span_, plan_.tables, *pool_);
         if (plan_.kv_elastic) { pool_->set_backed_pages(plan_.kv_base_pages); }
 
+        if (options_.vram_monitor && sleep_env_count("INFERNIX_SLEEP_AFTER_SECONDS") != 0 &&
+            sleep_env_count("INFERNIX_SLEEP_KV") == 1) {
+            if (!kv_vmm_) { throw std::runtime_error("KV sleep requires an elastic VMM KV pool"); }
+            sleep_kv_ = std::make_unique<VmmRangeSnapshot>(*kv_vmm_);
+        }
+
         io_layout_ = plan_.io;
         allocate(io_device_, io_layout_.bytes, allocated);
         io_host_ = PinnedHostBuffer(io_layout_.bytes);
@@ -2527,11 +2533,13 @@ private:
     // At an idle execution boundary: all streams settled, no lanes live, no leases outstanding.
     // Addresses and graphs survive; scratch is disposable and immutable weights have a RAM mirror.
     void sleep_expert_cache() {
+        // Publish completed prefix captures before snapshotting their device pages.
+        if (sleep_kv_ && prefix_) { prefix_->drain(); }
         // Quiesce every stream before the FIRST unmap, including free KV tails below.
         CUDA_CHECK(cudaDeviceSynchronize());
         // Only free, unreferenced page tails are trimmed. Do not evict prefix blocks just
         // to reach a numeric floor: retained-context follow-ups remain exact and cheap.
-        if (sleep_work_) { shrink_kv(false, true); }
+        if (sleep_work_ || sleep_kv_) { shrink_kv(false, true); }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         if (sleep_asleep_.load() || !residency_) { return; }
         if (!residency_->elastic()) {
@@ -2558,11 +2566,26 @@ private:
         const auto weight_bytes = weights ? weights->mapped_bytes() : 0;
         // Publish before the first unmap: even a failed transition must take the wake barrier.
         sleep_asleep_.store(true);
+        std::size_t kv_bytes = 0;
+        if (sleep_kv_) {
+            const auto before_kv = kv_vmm_->mapped_bytes();
+            try {
+                sleep_kv_->sleep(device_.transfer_stream);
+            } catch (const std::exception& error) {
+                // Host allocation/copy failure before unmap leaves KV usable. A
+                // partial unmap remains marked asleep and will be restored on wake.
+                diagnostic(std::string("KV sleep incomplete: ") + error.what(), DiagnosticLevel::Warning);
+            }
+            kv_bytes = before_kv - kv_vmm_->mapped_bytes();
+            sleep_kv_accounted_ = kv_bytes;
+            if (control_) { control_->account_fixed(-static_cast<std::int64_t>(kv_bytes)); }
+        }
         if (sleep_work_) { sleep_work_->sleep(); }
         if (sleep_staging_) { sleep_staging_->sleep(); }
         if (weights) { weights->sleep(); }
         diagnostic("sleep memory asleep | scratch " + std::to_string(scratch_bytes >> 20) +
-                   " MiB | weights " + std::to_string(weight_bytes >> 20) + " MiB | KV and state retained");
+                   " MiB | weights " + std::to_string(weight_bytes >> 20) + " MiB | KV offloaded " +
+                   std::to_string(kv_bytes >> 20) + " MiB | context retained");
         const std::uint64_t released = bytes_before > pool_now_ ? bytes_before - pool_now_ : 0;
         char part[96];
         std::snprintf(part, sizeof(part), " | %.2f s | free VRAM %llu MiB",
@@ -2576,8 +2599,27 @@ private:
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         if (!sleep_asleep_.load() || !residency_) { return; }
         const auto start           = Clock::now();
-        const std::uint32_t target = std::min(sleep_frames_awake_, residency_->frame_limit());
+        std::uint32_t target = std::min(sleep_frames_awake_, residency_->frame_limit());
+        // Empty expert frames are optional cache capacity, not conversation state.
+        // Avoid remapping the entire pre-sleep cache on the first-token path; the
+        // normal VRAM controller can grow it again after its configured delay.
+        if (sleep_kv_) {
+            auto initial_frames = sleep_wake_frames_;
+            // Multi-GiB KV makes essential restore dominate. Spend less of the
+            // critical-path allocation budget on empty optional expert frames.
+            if (sleep_kv_->saved_bytes() >= (2ULL << 30)) { initial_frames = std::min(initial_frames, 2048U); }
+            target = std::min(target, std::max(sleep_keep_frames_, initial_frames));
+        }
         device_.synchronize(); // the round's own work has not been enqueued yet; earlier work is done
+        // Restore exact KV bytes BEFORE map_kv (which zero-initializes new chunks),
+        // admission and prefix selection. The pool's backed-page metadata never changes.
+        if (sleep_kv_ && !sleep_kv_->wake(device_.transfer_stream)) {
+            throw runtime::RecoverableExecutionError("sleep wake: not enough VRAM to restore KV cache");
+        }
+        if (sleep_kv_accounted_ != 0) {
+            if (control_) { control_->account_fixed(static_cast<std::int64_t>(sleep_kv_accounted_)); }
+            sleep_kv_accounted_ = 0;
+        }
         auto* weights = parameters_.model.sleepable_weights();
         if ((weights && !weights->wake(device_.stream)) ||
             (sleep_work_ && !sleep_work_->wake(device_.stream)) ||
@@ -2602,7 +2644,11 @@ private:
         // wake starts with a warm cache instead of paying every miss over PCIe.
         std::uint32_t seeded = 0;
         if (sleep_state_) {
-            const auto max_keys = static_cast<std::uint32_t>(kSeedShare * static_cast<double>(residency_->frames()));
+            auto max_keys = static_cast<std::uint32_t>(kSeedShare * static_cast<double>(residency_->frames()));
+            // Do not refill half of a large expert cache on the critical wake
+            // path. Ordinary rounds refill misses using the existing staging path.
+            // Leave legacy sleep unchanged unless KV offload was selected.
+            if (sleep_kv_) { max_keys = std::min(max_keys, sleep_wake_seed_max_); }
             seeded              = residency_->warm_start(*sleep_state_, kSeedCountCap, max_keys, device_.stream);
             device_.synchronize();
             sleep_state_.reset();
@@ -2626,6 +2672,14 @@ private:
         if (!options_.vram_monitor) { return; }
         sleep_after_seconds_ = sleep_env_count("INFERNIX_SLEEP_AFTER_SECONDS");
         sleep_keep_frames_   = static_cast<std::uint32_t>(sleep_env_count("INFERNIX_SLEEP_KEEP_FRAMES"));
+        const char* seed_max = std::getenv("INFERNIX_SLEEP_WAKE_SEED_MAX");
+        sleep_wake_seed_max_ = seed_max ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                             sleep_env_count("INFERNIX_SLEEP_WAKE_SEED_MAX"),
+                                             std::numeric_limits<std::uint32_t>::max())) : 1024;
+        const char* wake_frames = std::getenv("INFERNIX_SLEEP_WAKE_FRAMES");
+        sleep_wake_frames_ = wake_frames ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                                sleep_env_count("INFERNIX_SLEEP_WAKE_FRAMES"),
+                                                std::numeric_limits<std::uint32_t>::max())) : 4096;
         sleep_busy_at_.store(Clock::now().time_since_epoch().count());
         if (sleep_after_seconds_ != 0) {
             if (auto* weights = parameters_.model.sleepable_weights()) {
@@ -2634,7 +2688,13 @@ private:
             diagnostic("expert-cache sleep armed | release after " + std::to_string(sleep_after_seconds_) +
                        " idle s | keep " + std::to_string(sleep_keep_frames_) + " frames | scratch " +
                        (sleep_work_ ? "on" : "off") + " | weights " +
-                       (parameters_.model.sleepable_weights() ? "on" : "off"));
+                       (parameters_.model.sleepable_weights() ? "on" : "off") + " | KV " +
+                       (sleep_kv_ ? "offload" : "resident") + " | wake seed max " +
+                       std::to_string(sleep_wake_seed_max_) + " | wake frame max " + std::to_string(sleep_wake_frames_));
+            diagnostic("sleep allocation inventory | KV mapped " + std::to_string(kv_vmm_ ? kv_vmm_->mapped_bytes() >> 20 : plan_.kv >> 20) +
+                       " MiB | recurrent/state " + std::to_string(plan_.bytes.state >> 20) +
+                       " MiB | IO/speculation " + std::to_string(plan_.bytes.io >> 20) +
+                       " MiB | expert metadata " + std::to_string(plan_.bytes.residency >> 20) + " MiB");
         }
         const VramSnapshot now = vram_->query();
         if (residency_->elastic()) {
@@ -2962,17 +3022,18 @@ public:
     // At a boundary (no round's kernels in flight; `idle`: no request active): resizes the expert
     // cache to the control law's decision.
     void apply_vram_target(bool idle) {
+        // Idle maintenance must not shrink/evict a pool whose physical backing is
+        // in RAM. A real request goes through the full wake barrier first.
+        if (sleep_asleep_.load()) {
+            if (!idle) { wake_expert_cache("a round resumed"); }
+            return;
+        }
         if (idle && kv_idle_due() &&
             std::all_of(lanes_.begin(), lanes_.end(), [](const Lane& l) { return l.phase == Phase::Free; })) {
             kv_busy(); // one attempt per idle period: blocks without host copies may still hold the top
             shrink_kv(true);
         }
         if (sleep_after_seconds_ != 0) {
-            if (sleep_asleep_.load()) {
-                // Asleep: a request wakes the frames; nothing may grow the cache back meanwhile.
-                if (!idle) { wake_expert_cache("a round resumed"); }
-                return;
-            }
             if (!idle) { note_round_activity(); }
             if (idle && sleep_due() && !wide_active_ && !walk_.active &&
                 !work_lease_.valid() && !stream_lease_.valid() &&
@@ -4689,6 +4750,8 @@ private:
     std::uint32_t sleep_keep_frames_   = 0;
     std::atomic<std::int64_t> sleep_busy_at_{0}; // last round with work (the monitor thread reads it)
     std::atomic<bool> sleep_asleep_{false};      // the frames are released
+    std::uint32_t sleep_wake_seed_max_ = 1024;
+    std::uint32_t sleep_wake_frames_ = 4096;
     std::uint32_t sleep_frames_awake_ = 0;       // frames before the sleep (guarded by vram_mutex_)
     // The cache's LFRU counts and resident ranking, captured before the frames are released so a
     // wake can reseed the hottest experts instead of starting from an empty cache (guarded by
@@ -4914,6 +4977,8 @@ private:
                                        std::chrono::duration_cast<std::chrono::steady_clock::duration>(kKvIdleShrink).count();
     }
     std::unique_ptr<VmmRange> kv_vmm_;
+    std::unique_ptr<VmmRangeSnapshot> sleep_kv_;
+    std::size_t sleep_kv_accounted_ = 0;
     DeviceSpan kv_span_{};
 
     // Maps (and zeroes) the chunks pages [0, pages) need; false when the device has no memory.
@@ -4979,6 +5044,7 @@ private:
     // conversation that has ended gives its memory back to the frames. The delay keeps a follow-up
     // turn from paying a restore and an expert reload for memory the idle gap never used.
     void shrink_kv(bool evict = false, bool sleeping = false) {
+        if (sleep_kv_ && sleep_kv_->asleep()) { return; }
         const std::uint32_t floor = sleeping ? 0U : plan_.kv_base_pages;
         if (!kv_vmm_ || pool_->backed_pages() <= floor) { return; }
         if (evict && prefix_) {
